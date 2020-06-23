@@ -6,6 +6,9 @@
 #include "uart.h"
 #include "user_interface.h"
 
+#define T_CALIB     -3
+#define RH_CALIB    +1
+
 static volatile enum
 {
     STARTING = 0,
@@ -18,7 +21,8 @@ static volatile enum
     RECEIVING_ONE = 7,
     RECEIVED_DATA = 8,
     ERROR = 9,
-    RESET = 10
+    RESET = 10,
+    DONE = 11
 } state = RESET, previous_state = RESET;
 
 static const int pin = 2;
@@ -35,14 +39,18 @@ static os_timer_t os_timer;
 
 void starting(void)
 {
-    GPIO_OUTPUT_SET(pin, 0);
-    state = STARTED;
-    hw_timer_elapsed = 0;
+    GPIO_OUTPUT_SET(pin, ~(GPIO_INPUT_GET(pin)));
+    if (hw_timer_elapsed > 1000)
+    {
+        GPIO_OUTPUT_SET(pin, 0);
+        state = STARTED;
+        hw_timer_elapsed = 0;
+    }
 }
 
 void started(void)
 {
-    if (hw_timer_elapsed >= 18000)
+    if (hw_timer_elapsed > 18000)
     {
         GPIO_OUTPUT_SET(pin, 1);
         GPIO_DIS_OUTPUT(pin);
@@ -53,14 +61,16 @@ void started(void)
 
 void waiting(void)
 {
-    if (hw_timer_elapsed > 40 && GPIO_INPUT_GET(pin))
+    if (hw_timer_elapsed > 40)
     {
         state = ERROR;
         return;
     }
-
-    state = RECEIVING_RESPONSE;
-    hw_timer_elapsed = 0;
+    if (!GPIO_INPUT_GET(pin))
+    {
+        state = RECEIVING_RESPONSE;
+        hw_timer_elapsed = 0;
+    }
 }
 
 void receiving_response(void)
@@ -180,11 +190,11 @@ void received_data(void)
     int x = rh_integral + rh_decimal + t_integral + t_decimal;
 
     os_printf("32-bit data: %d\r\n", data);
-    os_printf("Temp: %d.%d - RH (%c): %d.%d\r\n", t_integral, t_decimal, '%', rh_integral, rh_decimal);
+    os_printf("Temp: %d.%d - RH (%c): %d.%d\r\n", t_integral + T_CALIB, t_decimal, '%', rh_integral + RH_CALIB, rh_decimal);
     os_printf("Checksum (calculated/supplied): %d/%d\r\n", x, checksum);
     os_printf("\r\n");
 
-    state = RESET;
+    state = DONE;
 }
 
 void error(void)
@@ -195,7 +205,7 @@ void error(void)
 
 void reset(void)
 {
-    if (reset_timer_elapsed > 10000000)
+    if (reset_timer_elapsed > 2000000)
     {
         state = STARTING;
         reset_timer_elapsed = 0;
@@ -216,6 +226,11 @@ void reset(void)
     {
         reset_timer_elapsed += hw_timer_interval;
     }
+}
+
+void done(void)
+{
+    state = RESET;
 }
 
 
@@ -260,6 +275,9 @@ void hw_timerfunc(void)
             break;
         case RESET:
             reset();
+            break;
+        case DONE:
+            done();
             break;
     }
 
