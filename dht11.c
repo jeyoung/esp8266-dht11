@@ -5,9 +5,12 @@
 #include "osapi.h"
 #include "uart.h"
 #include "user_interface.h"
+#include "wifi_credentials.h"
 
 #define T_CALIB     -3
 #define RH_CALIB    +1
+
+#define PAUSE_TIME_US   60000000
 
 static volatile enum
 {
@@ -189,6 +192,7 @@ void received_data(void)
 
     int x = rh_integral + rh_decimal + t_integral + t_decimal;
 
+    os_printf("\r\n");
     os_printf("32-bit data: %d\r\n", data);
     os_printf("Temp: %d.%d - RH (%c): %d.%d\r\n", t_integral + T_CALIB, t_decimal, '%', rh_integral + RH_CALIB, rh_decimal);
     os_printf("Checksum (calculated/supplied): %d/%d\r\n", x, checksum);
@@ -205,7 +209,7 @@ void error(void)
 
 void reset(void)
 {
-    if (reset_timer_elapsed > 2000000)
+    if (reset_timer_elapsed > PAUSE_TIME_US)
     {
         state = STARTING;
         reset_timer_elapsed = 0;
@@ -216,11 +220,21 @@ void reset(void)
 
         hw_timer_interval = 10;
         hw_timer_elapsed = 0;
+
+        wifi_fpm_do_wakeup();
+        wifi_fpm_close();
+        wifi_set_opmode(STATION_MODE);
+        wifi_station_connect();
     }
     else if (hw_timer_interval != 1000000)
     {
         hw_timer_interval = 1000000;
         os_printf("HW timer interval set to %d\r\n", hw_timer_interval);
+
+        wifi_station_disconnect();
+        wifi_set_opmode(NULL_MODE);
+        wifi_fpm_open();
+        wifi_fpm_do_sleep(PAUSE_TIME_US);
     }
     else
     {
@@ -284,10 +298,29 @@ void hw_timerfunc(void)
     hw_timer_arm(hw_timer_interval);
 }
 
+void ICACHE_FLASH_ATTR
+user_set_station_config(void)
+{
+    wifi_set_sleep_type(MODEM_SLEEP_T);
+    wifi_set_opmode(STATION_MODE);
+
+    // SSID and PASSWORD must be defined in wifi_credentials.h
+    char ssid[32] = SSID;
+    char password[64] = PASSWORD;
+
+    struct station_config stationConf;
+    stationConf.bssid_set = 0; //need not check MAC address of AP
+
+    os_memcpy(&stationConf.ssid, ssid, 32);
+    os_memcpy(&stationConf.password, password, 64);
+    wifi_station_set_config(&stationConf);
+}
+
 void ICACHE_FLASH_ATTR user_init()
 {
-    wifi_set_sleep_type(NONE_SLEEP_T);
     uart_init(BIT_RATE_115200, BIT_RATE_115200);
+
+    user_set_station_config();
 
     gpio_init();
     PIN_PULLUP_DIS(PERIPHS_IO_MUX_GPIO2_U);
