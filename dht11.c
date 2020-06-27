@@ -10,7 +10,8 @@
 #define T_CALIB     -3
 #define RH_CALIB    +1
 
-#define PAUSE_TIME_US   60000000
+#define STARTING_DELAY_US    (2*1000000)
+#define PAUSE_TIME_US     (3*60*1000000) // Maxiumum is 268435455
 
 static volatile enum
 {
@@ -26,11 +27,11 @@ static volatile enum
     ERROR = 9,
     RESET = 10,
     DONE = 11
-} state = RESET, previous_state = RESET;
+} state = STARTING, previous_state = STARTING;
 
 static const int pin = 2;
 
-static volatile int hw_timer_interval = 1000000;
+static volatile uint32_t timer_interval_us = 10;
 static volatile int reset_timer_elapsed = 0;
 static volatile int hw_timer_elapsed = 0;
 
@@ -43,7 +44,7 @@ static os_timer_t os_timer;
 void starting(void)
 {
     GPIO_OUTPUT_SET(pin, ~(GPIO_INPUT_GET(pin)));
-    if (hw_timer_elapsed > 1000)
+    if (hw_timer_elapsed > STARTING_DELAY_US)
     {
         GPIO_OUTPUT_SET(pin, 0);
         state = STARTED;
@@ -207,39 +208,38 @@ void error(void)
     state = RESET;
 }
 
+void wifi_wakeupfunc(void)
+{
+    state = STARTING;
+    reset_timer_elapsed = 0;
+
+    data = 0;
+    checksum = 0;
+    data_counter = 0;
+
+    hw_timer_elapsed = 0;
+
+    wifi_fpm_do_wakeup();
+    wifi_fpm_close();
+    wifi_fpm_set_sleep_type(MODEM_SLEEP_T);
+    wifi_set_opmode(STATION_MODE);
+    wifi_station_connect();
+
+    os_printf("Arming HW timer for %d μs...\r\n", timer_interval_us);
+
+    hw_timer_arm(timer_interval_us);
+}
+
 void reset(void)
 {
-    if (reset_timer_elapsed > PAUSE_TIME_US)
-    {
-        state = STARTING;
-        reset_timer_elapsed = 0;
+    os_printf("Going in light sleep for %d ms...\r\n", PAUSE_TIME_US/1000);
 
-        data = 0;
-        checksum = 0;
-        data_counter = 0;
-
-        hw_timer_interval = 10;
-        hw_timer_elapsed = 0;
-
-        wifi_fpm_do_wakeup();
-        wifi_fpm_close();
-        wifi_set_opmode(STATION_MODE);
-        wifi_station_connect();
-    }
-    else if (hw_timer_interval != 1000000)
-    {
-        hw_timer_interval = 1000000;
-        os_printf("HW timer interval set to %d\r\n", hw_timer_interval);
-
-        wifi_station_disconnect();
-        wifi_set_opmode(NULL_MODE);
-        wifi_fpm_open();
-        wifi_fpm_do_sleep(PAUSE_TIME_US);
-    }
-    else
-    {
-        reset_timer_elapsed += hw_timer_interval;
-    }
+    wifi_station_disconnect();
+    wifi_fpm_set_sleep_type(LIGHT_SLEEP_T);
+    wifi_set_opmode(NULL_MODE);
+    wifi_fpm_open();
+    wifi_fpm_set_wakeup_cb(wifi_wakeupfunc);
+    wifi_fpm_do_sleep(PAUSE_TIME_US);
 }
 
 void done(void)
@@ -250,7 +250,7 @@ void done(void)
 
 void hw_timerfunc(void)
 {
-    hw_timer_elapsed += hw_timer_interval;
+    hw_timer_elapsed += timer_interval_us;
 
     if (state != ERROR)
         previous_state = state;
@@ -295,7 +295,8 @@ void hw_timerfunc(void)
             break;
     }
 
-    hw_timer_arm(hw_timer_interval);
+    if (state != RESET)
+        hw_timer_arm(timer_interval_us);
 }
 
 void ICACHE_FLASH_ATTR
@@ -319,7 +320,6 @@ user_set_station_config(void)
 void ICACHE_FLASH_ATTR user_init()
 {
     uart_init(BIT_RATE_115200, BIT_RATE_115200);
-
     user_set_station_config();
 
     gpio_init();
@@ -327,5 +327,5 @@ void ICACHE_FLASH_ATTR user_init()
 
     hw_timer_init(FRC1_SOURCE, 0);
     hw_timer_set_func(hw_timerfunc);
-    hw_timer_arm(hw_timer_interval);
+    hw_timer_arm(timer_interval_us);
 }
