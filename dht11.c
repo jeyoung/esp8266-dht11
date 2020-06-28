@@ -18,7 +18,8 @@
 #define RH_CALIB +1
 
 #define STARTING_DELAY_US   (5*1000000)
-#define SNTP_RETRY_INTERVAL (STARTING_DELAY_US/1000)
+#define POST_WAKEUP_DELAY        (5000)
+#define PRE_SLEEP_DELAY            (10)
 
 // The maximum value for PAUSE_TIME_US is the same as the maximum for
 // `wifi_fpm_do_sleep(uint32)`.
@@ -57,19 +58,28 @@ static volatile int post_wakeup_completed = 0;
 static struct espconn espconn;
 static ip_addr_t ip_addr;
 
+static volatile int espconn_disconnecting = 0;
+static volatile int pre_sleeping = 0;
+
 void pre_sleep(void)
 {
-    sntp_stop();
+    espconn_disconnecting = 1;
     espconn_secure_disconnect(&espconn);
+
+    sntp_stop();
+
+    wifi_station_disconnect();
+    wifi_set_opmode(NULL_MODE);
+
+    os_printf("Going in light sleep for %d ms...\r\n", PAUSE_TIME_US/1000);
 }
 
 void post_wakeup_timerfunc(void *args)
 {
-
     uint32_t current_timestamp = sntp_get_current_timestamp();
     if (current_timestamp == 0)
     {
-        os_timer_arm(&post_wakeup_timer, SNTP_RETRY_INTERVAL, 0);
+        os_timer_arm(&post_wakeup_timer, POST_WAKEUP_DELAY  , 0);
         post_wakeup_completed = 0;
     }
     else
@@ -88,6 +98,9 @@ void post_wakeup_timerfunc(void *args)
 
 void post_wakeup()
 {
+    wifi_set_opmode(STATION_MODE);
+    wifi_station_connect();
+
     sntp_setservername(0, "ntp01.algon.dk");
     sntp_setservername(1, "ntp.uit.one");
     sntp_setservername(2, "time.windows.com");
@@ -96,7 +109,7 @@ void post_wakeup()
 
     os_timer_disarm(&post_wakeup_timer);
     os_timer_setfn(&post_wakeup_timer, (os_timer_func_t *)post_wakeup_timerfunc, NULL);
-    os_timer_arm(&post_wakeup_timer, SNTP_RETRY_INTERVAL, 0);
+    os_timer_arm(&post_wakeup_timer, POST_WAKEUP_DELAY  , 0);
     post_wakeup_completed = 0;
 }
 
@@ -118,6 +131,9 @@ void ICACHE_FLASH_ATTR conn_reconnect_cb(void *arg, sint8 err)
 
 void ICACHE_FLASH_ATTR conn_disconnect_cb(void *arg)
 {
+    espconn_disconnecting = 0;
+    struct espconn *espconn = (struct espconn *)arg;
+    os_free(espconn->proto.tcp);
     os_printf("Disconnected\r\n");
 }
 
@@ -348,22 +364,29 @@ void wifi_wakeupfunc(void)
 
     wifi_fpm_do_wakeup();
     wifi_fpm_close();
-    wifi_fpm_set_sleep_type(MODEM_SLEEP_T);
-    wifi_set_opmode(STATION_MODE);
-    wifi_station_connect();
+    wifi_fpm_set_sleep_type(NONE_SLEEP_T);
 
     post_wakeup();
 }
 
 void reset(void)
 {
-    os_printf("Going in light sleep for %d ms...\r\n", PAUSE_TIME_US/1000);
+    if (espconn_disconnecting)
+    {
+        hw_timer_arm(PRE_SLEEP_DELAY);
+        return;
+    }
 
-    pre_sleep();
+    if (!pre_sleeping)
+    {
+        pre_sleep();
+        pre_sleeping = 1;
+        return;
+    }
 
-    wifi_station_disconnect();
+    pre_sleeping = 0;
+
     wifi_fpm_set_sleep_type(LIGHT_SLEEP_T);
-    wifi_set_opmode(NULL_MODE);
     wifi_fpm_open();
     wifi_fpm_set_wakeup_cb(wifi_wakeupfunc);
     wifi_fpm_do_sleep(PAUSE_TIME_US);
