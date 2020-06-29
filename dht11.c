@@ -17,13 +17,14 @@
 #define T_CALIB  -3
 #define RH_CALIB +1
 
-#define STARTING_DELAY_US   (5*1000000)
+#define STARTING_DELAY_US   (1*1000000)
 #define CONNECTION_DELAY_US (5*1000000)
 #define SLEEP_DELAY_US      (5*1000000)
+#define SLEEP_TIMEOUT_US    (5*1000000)
 
 // The maximum value for PAUSE_TIME_US is the same as the maximum for
 // `wifi_fpm_do_sleep(uint32)`.
-#define PAUSE_TIME_US       (240*1000000)
+#define PAUSE_TIME_US       (3*1000000)
 
 static volatile enum
 {
@@ -348,6 +349,7 @@ void pre_sleep(void)
     os_printf("Going in light sleep for %d ms...\r\n", PAUSE_TIME_US/1000);
 
     state = SLEEP;
+    hw_timer_elapsed = 0;
 }
 
 void wifi_wakeup_cb(void)
@@ -360,7 +362,7 @@ void wifi_wakeup_cb(void)
 
 void sleep(void)
 {
-    if (espconn_disconnecting)
+    if (espconn_disconnecting && hw_timer_elapsed < SLEEP_TIMEOUT_US)
     {
         hw_timer_arm(SLEEP_DELAY_US);
         return;
@@ -464,10 +466,7 @@ void hw_timerfunc(void)
             break;
     }
 
-    if (state != SLEEP)
-    {
-        hw_timer_arm(timer_interval_us);
-    }
+    hw_timer_arm(timer_interval_us);
 }
 
 void ICACHE_FLASH_ATTR start_wifi_station(void)
