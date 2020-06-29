@@ -18,15 +18,16 @@
 #define RH_CALIB +1
 
 #define STARTING_DELAY_US   (5*1000000)
-#define POST_WAKEUP_DELAY        (5000)
-#define PRE_SLEEP_DELAY            (10)
+#define CONNECTION_DELAY_US (5*1000000)
+#define SLEEP_DELAY_US      (5*1000000)
 
 // The maximum value for PAUSE_TIME_US is the same as the maximum for
 // `wifi_fpm_do_sleep(uint32)`.
-#define PAUSE_TIME_US       (30*1000000)
+#define PAUSE_TIME_US       (240*1000000)
 
 static volatile enum
 {
+    RESET = -1,
     STARTING = 0,
     STARTED = 1,
     WAITING = 2,
@@ -37,9 +38,12 @@ static volatile enum
     RECEIVING_ONE = 7,
     RECEIVED_DATA = 8,
     ERROR = 9,
-    RESET = 10,
-    DONE = 11
-} state = STARTING, previous_state = STARTING;
+    DONE = 10,
+    PRE_SLEEP = 11,
+    SLEEP = 12,
+    WAKEUP = 13,
+    POST_WAKEUP = 14
+} state = WAKEUP, previous_state = WAKEUP;
 
 static const int pin = 2;
 
@@ -51,72 +55,19 @@ static volatile int data = 0;
 static volatile int checksum = 0;
 static volatile int data_counter = 0;
 
-static os_timer_t post_wakeup_timer;
-
-static volatile int post_wakeup_completed = 0;
-
 static struct espconn espconn;
 static ip_addr_t ip_addr;
 
 static volatile int espconn_disconnecting = 0;
-static volatile int pre_sleeping = 0;
-
-void pre_sleep(void)
-{
-    espconn_disconnecting = 1;
-    espconn_secure_disconnect(&espconn);
-
-    sntp_stop();
-
-    wifi_station_disconnect();
-    wifi_set_opmode(NULL_MODE);
-
-    os_printf("Going in light sleep for %d ms...\r\n", PAUSE_TIME_US/1000);
-}
-
-void post_wakeup_timerfunc(void *args)
-{
-    uint32_t current_timestamp = sntp_get_current_timestamp();
-    if (current_timestamp == 0)
-    {
-        os_timer_arm(&post_wakeup_timer, POST_WAKEUP_DELAY  , 0);
-        post_wakeup_completed = 0;
-    }
-    else
-    {
-        os_timer_disarm(&post_wakeup_timer);
-        post_wakeup_completed = 1;
-
-        os_printf("\r\n");
-        os_printf("Unix timestamp: %d, Time (UTC): %s\r\n",
-                current_timestamp, sntp_get_real_time(current_timestamp));
-
-        os_printf("Arming HW timer for %d μs...\r\n", timer_interval_us);
-        hw_timer_arm(timer_interval_us);
-    }
-}
-
-void post_wakeup()
-{
-    wifi_set_opmode(STATION_MODE);
-    wifi_station_connect();
-
-    sntp_setservername(0, "ntp01.algon.dk");
-    sntp_setservername(1, "ntp.uit.one");
-    sntp_setservername(2, "time.windows.com");
-    sntp_set_timezone(0);
-    sntp_init();
-
-    os_timer_disarm(&post_wakeup_timer);
-    os_timer_setfn(&post_wakeup_timer, (os_timer_func_t *)post_wakeup_timerfunc, NULL);
-    os_timer_arm(&post_wakeup_timer, POST_WAKEUP_DELAY  , 0);
-    post_wakeup_completed = 0;
-}
 
 void ICACHE_FLASH_ATTR conn_receive_cb(void *arg, char *pdata, unsigned short len)
 {
     struct espconn *espconn = (struct espconn *)arg;
+#if 0
     os_printf("Size: %d, Received: %s\r\n", len, pdata);
+#else
+    os_printf("Received %d bytes\r\n", len);
+#endif
 }
 
 void ICACHE_FLASH_ATTR conn_sent_cb(void *arg)
@@ -181,13 +132,34 @@ void ICACHE_FLASH_ATTR conn_hostfound_cb(const char *name, ip_addr_t *ip_addr, v
     }
 }
 
+void reset()
+{
+    os_printf("Resetting...\r\n");
+
+    data = 0;
+    checksum = 0;
+    data_counter = 0;
+
+    state = STARTING;
+    hw_timer_elapsed = 0;
+
+    timer_interval_us = 10;
+
+    uint32 current_timestamp = sntp_get_current_timestamp();
+
+    os_printf("\r\n");
+    os_printf("Unix timestamp: %d, Time (UTC): %s\r\n",
+            current_timestamp, sntp_get_real_time(current_timestamp));
+}
+
 void starting(void)
 {
     GPIO_OUTPUT_SET(pin, ~(GPIO_INPUT_GET(pin)));
 
-    if (hw_timer_elapsed > STARTING_DELAY_US && post_wakeup_completed)
+    if (hw_timer_elapsed > STARTING_DELAY_US)
     {
         GPIO_OUTPUT_SET(pin, 0);
+
         state = STARTED;
         hw_timer_elapsed = 0;
     }
@@ -199,6 +171,7 @@ void started(void)
     {
         GPIO_OUTPUT_SET(pin, 1);
         GPIO_DIS_OUTPUT(pin);
+
         state = WAITING;
         hw_timer_elapsed = 0;
     }
@@ -327,6 +300,9 @@ void receiving_one(void)
 
 void received_data(void)
 {
+    espconn_gethostbyname(&espconn, "vpn.priscimon.net", &ip_addr, conn_hostfound_cb);
+    timer_interval_us = CONNECTION_DELAY_US;
+
     int rh_integral = data >> 24;
     int rh_decimal = (data & ~(0xFF << 24)) >> 16;
     int t_integral = (data & ~(0xFFFF << 16)) >> 8;
@@ -336,11 +312,10 @@ void received_data(void)
 
     os_printf("\r\n");
     os_printf("32-bit data: %d\r\n", data);
-    os_printf("Temp: %d.%d - RH (%c): %d.%d\r\n", t_integral + T_CALIB, t_decimal, '%', rh_integral + RH_CALIB, rh_decimal);
+    os_printf("Temp: %d.%d - RH (%c): %d.%d\r\n",
+            t_integral + T_CALIB, t_decimal, '%', rh_integral + RH_CALIB, rh_decimal);
     os_printf("Checksum (calculated/supplied): %d/%d\r\n", x, checksum);
     os_printf("\r\n");
-
-    espconn_gethostbyname(&espconn, "vpn.priscimon.net", &ip_addr, conn_hostfound_cb);
 
     state = DONE;
 }
@@ -348,53 +323,86 @@ void received_data(void)
 void error(void)
 {
     os_printf("Error: %d\r\n", previous_state);
-    state = RESET;
-}
-
-void wifi_wakeupfunc(void)
-{
-    state = STARTING;
-    reset_timer_elapsed = 0;
-
-    data = 0;
-    checksum = 0;
-    data_counter = 0;
-
-    hw_timer_elapsed = 0;
-
-    wifi_fpm_do_wakeup();
-    wifi_fpm_close();
-    wifi_fpm_set_sleep_type(NONE_SLEEP_T);
-
-    post_wakeup();
-}
-
-void reset(void)
-{
-    if (espconn_disconnecting)
-    {
-        hw_timer_arm(PRE_SLEEP_DELAY);
-        return;
-    }
-
-    if (!pre_sleeping)
-    {
-        pre_sleep();
-        pre_sleeping = 1;
-        return;
-    }
-
-    pre_sleeping = 0;
-
-    wifi_fpm_set_sleep_type(LIGHT_SLEEP_T);
-    wifi_fpm_open();
-    wifi_fpm_set_wakeup_cb(wifi_wakeupfunc);
-    wifi_fpm_do_sleep(PAUSE_TIME_US);
+    state = DONE;
 }
 
 void done(void)
 {
+    os_printf("Done\r\n");
+
+    timer_interval_us = 1000;
+    state = PRE_SLEEP;
+}
+
+void pre_sleep(void)
+{
+    os_printf("Pre-sleeping...\r\n");
+    sntp_stop();
+
+    espconn_disconnecting = 1;
+    espconn_secure_disconnect(&espconn);
+
+    wifi_station_disconnect();
+    wifi_set_opmode(NULL_MODE);
+
+    os_printf("Going in light sleep for %d ms...\r\n", PAUSE_TIME_US/1000);
+
+    state = SLEEP;
+}
+
+void wifi_wakeup_cb(void)
+{
+    state = WAKEUP;
+    hw_timer_elapsed = 0;
+
+    hw_timer_arm(timer_interval_us);
+}
+
+void sleep(void)
+{
+    if (espconn_disconnecting)
+    {
+        hw_timer_arm(SLEEP_DELAY_US);
+        return;
+    }
+
+    wifi_fpm_set_sleep_type(LIGHT_SLEEP_T);
+    wifi_fpm_open();
+    wifi_fpm_set_wakeup_cb(wifi_wakeup_cb);
+    wifi_fpm_do_sleep(PAUSE_TIME_US);
+}
+
+void wakeup(void)
+{
+    os_printf("Waking up...\r\n");
+
+    wifi_fpm_do_wakeup();
+    wifi_fpm_close();
+    wifi_fpm_set_sleep_type(NONE_SLEEP_T);
+    wifi_set_opmode(STATION_MODE);
+    wifi_station_connect();
+
+    sntp_setservername(0, "ntp01.algon.dk");
+    sntp_setservername(1, "ntp.uit.one");
+    sntp_setservername(2, "time.windows.com");
+    sntp_set_timezone(0);
+    sntp_init();
+
+    state = POST_WAKEUP;
+    hw_timer_elapsed = 0;
+
+    timer_interval_us = CONNECTION_DELAY_US;
+}
+
+void post_wakeup()
+{
+    uint32_t current_timestamp = sntp_get_current_timestamp();
+
+    if (current_timestamp == 0)
+        return;
+
     state = RESET;
+    hw_timer_elapsed = 0;
 }
 
 void hw_timerfunc(void)
@@ -406,6 +414,9 @@ void hw_timerfunc(void)
 
     switch (state)
     {
+        case RESET:
+            reset();
+            break;
         case STARTING:
             starting();
             break;
@@ -436,16 +447,27 @@ void hw_timerfunc(void)
         case ERROR:
             error();
             break;
-        case RESET:
-            reset();
-            break;
         case DONE:
             done();
             break;
+        case PRE_SLEEP:
+            pre_sleep();
+            break;
+        case SLEEP:
+            sleep();
+            break;
+        case WAKEUP:
+            wakeup();
+            break;
+        case POST_WAKEUP:
+            post_wakeup();
+            break;
     }
 
-    if (state != RESET)
+    if (state != SLEEP)
+    {
         hw_timer_arm(timer_interval_us);
+    }
 }
 
 void ICACHE_FLASH_ATTR start_wifi_station(void)
@@ -468,13 +490,10 @@ void ICACHE_FLASH_ATTR start_wifi_station(void)
 void ICACHE_FLASH_ATTR user_init(void)
 {
     uart_init(BIT_RATE_115200, BIT_RATE_115200);
-
     start_wifi_station();
 
     gpio_init();
     PIN_PULLUP_DIS(PERIPHS_IO_MUX_GPIO2_U);
-
-    post_wakeup();
 
     hw_timer_init(FRC1_SOURCE, 0);
     hw_timer_set_func(hw_timerfunc);
