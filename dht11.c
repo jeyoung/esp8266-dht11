@@ -17,14 +17,14 @@
 #define T_CALIB  -3
 #define RH_CALIB +1
 
-#define STARTING_DELAY_US   (1*1000000)
-#define CONNECTION_DELAY_US (5*1000000)
-#define SLEEP_DELAY_US      (5*1000000)
-#define SLEEP_TIMEOUT_US    (5*1000000)
+#define STARTING_DELAY_US     (2*1000000)
+#define CONNECTION_DELAY_US   (5*1000000)
+#define SLEEP_DELAY_US        (5*1000000)
+#define SLEEP_TIMEOUT_US     (10*1000000)
 
 // The maximum value for PAUSE_TIME_US is the same as the maximum for
 // `wifi_fpm_do_sleep(uint32)`.
-#define PAUSE_TIME_US       (3*1000000)
+#define PAUSE_TIME_US        (10*1000000)
 
 static volatile enum
 {
@@ -350,6 +350,9 @@ void pre_sleep(void)
 
     state = SLEEP;
     hw_timer_elapsed = 0;
+
+    timer_interval_us = SLEEP_DELAY_US;
+    hw_timer_arm(timer_interval_us);
 }
 
 void wifi_wakeup_cb(void)
@@ -364,9 +367,10 @@ void sleep(void)
 {
     if (espconn_disconnecting && hw_timer_elapsed < SLEEP_TIMEOUT_US)
     {
-        hw_timer_arm(SLEEP_DELAY_US);
+        hw_timer_arm(timer_interval_us);
         return;
     }
+
 
     wifi_fpm_set_sleep_type(LIGHT_SLEEP_T);
     wifi_fpm_open();
@@ -466,7 +470,8 @@ void hw_timerfunc(void)
             break;
     }
 
-    hw_timer_arm(timer_interval_us);
+    if (state != SLEEP)
+        hw_timer_arm(timer_interval_us);
 }
 
 void ICACHE_FLASH_ATTR start_wifi_station(void)
